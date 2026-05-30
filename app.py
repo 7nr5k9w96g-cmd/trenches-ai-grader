@@ -26,7 +26,7 @@ if "app_mode" not in st.session_state:
     st.session_state["app_mode"] = "Film Room & Grading"
 
 # --- VIDEO HELPER: SAMPLE FRAMES FOR GPT-4o ---
-def extract_video_frames(video_path, max_frames=10):
+def extract_video_frames(video_path, max_frames=12):
     if cv2 is None:
         return None
     base64_frames = []
@@ -75,10 +75,8 @@ def firebase_auth_request(endpoint, email, password):
         if response.status_code == 200:
             return res_data, None
         else:
-            # Extract readable human errors from Firebase API
             error_msg = res_data.get("error", {}).get("message", "Authentication rejected.")
-            # Map common Firebase codes to clean error notices
-            if error_msg == "EMAIL_NOT_FOUND" or error_msg == "INVALID_PASSWORD" or error_msg == "INVALID_LOGIN_CREDENTIALS":
+            if error_msg in ["EMAIL_NOT_FOUND", "INVALID_PASSWORD", "INVALID_LOGIN_CREDENTIALS"]:
                 return None, "Invalid email address or account password."
             elif error_msg == "EMAIL_EXISTS":
                 return None, "An account with this email address already exists."
@@ -98,12 +96,12 @@ def analyze_football_film_with_openai(video_path):
         return None
         
     if cv2 is None:
-        st.error("Missing dependencies: 'opencv-python' must be installed on your backend machine hosting this instance.")
+        st.error("Missing dependencies: 'opencv-python-headless' must be installed on your backend machine.")
         return None
 
     try:
         with st.spinner("Analyzing film timeline using professional O-Line grading standards..."):
-            base64_frames = extract_video_frames(video_path, max_frames=10)
+            base64_frames = extract_video_frames(video_path, max_frames=12)
             if not base64_frames:
                 st.error("Could not parse or decode frames from this video file.")
                 return None
@@ -116,21 +114,21 @@ def analyze_football_film_with_openai(video_path):
             
             coaching_prompt = (
                 "You are an elite, NFL-level offensive line coach and film coordinator. Analyze these chronological video frames of a football play. "
+                "FIRST, look at the alignment, movement dynamics, and block tracks to determine if this is a RUN play or a PASS play. "
                 "Evaluate the technique, footwork, stance, and assignment execution for all 5 positions: LT, LG, C, RG, RT. "
-                "You MUST use advanced professional offensive line coaching terminology (e.g., independent hand strikes, vertical set, 45-set, "
-                "jump set, anchoring against a heavy bull rush, matching cross-face leverage, active hand replacement, tracking the inside hip pocket, "
-                "keeping a wide base, maintaining knee bend, recovering against edge speed counters, passing off a stunt/twist, "
-                "establishing explosive initial get-off, resetting the anchor). "
+                "You MUST apply accurate context-driven coaching terminology based on the play profile: "
+                "- IF RUN PLAY: Evaluate explosive initial get-off, drive blocks, down blocks, reach blocks, scoop blocks, combo/double-teams, climbing to linebackers at the second level, tracking inside hip pockets, and maintaining a low pad level. "
+                "- IF PASS PLAY: Evaluate pass sets (vertical set, 45-set, jump set), independent hand strikes, active hand replacement, maintaining knee bend, anchoring against a bull rush, recovering against edge speed counters, and passing off stunts/twists. "
                 "CRITICAL GRADING SCALE RULES (Strictly enforce these rules for the 'score' integer): "
-                "- Use a score of 0 if the lineman DID NOT do their job correctly and WAS NOT physical (for example: if a lineman lets their defender through, completely misses an assignment, gets beaten cleanly, or shows zero physicality/effort, this is an automatic 0). "
-                "- Use intermediate scores of 1 or 2 if they executed parts of the assignment but had technical flaws or lacked total control. "
-                "- Use a score of 3 ONLY if the lineman did their job completely properly AND was highly physical, dominant, and locked down their assignment. "
+                "- Use a score of 0 if the lineman DID NOT do their job correctly and WAS NOT physical (e.g., lets defender through cleanly, completely misses assignments). "
+                "- Use intermediate scores of 1 or 2 if they executed parts of the assignment but had technical flaws or lacked control. "
+                "- Use a score of 3 ONLY if the lineman executed their job perfectly AND was highly physical, dominant, and locked down their assignment. "
                 "For each position, write a highly detailed, comprehensive coaching breakdown (3-5 sentences long) evaluating "
-                "their precise movement mechanics, execution wins, and technical failures. Be hyper-specific and thorough. "
-                "Provide your response STRICTLY in this JSON format, with no markdown tags or backticks: "
-                '{"LT": {"score": 3, "note": "Detailed paragraph text..."}, "LG": {"score": 2, "note": "Detailed paragraph text..."}, '
-                '"C": {"score": 1, "note": "Detailed paragraph text..."}, "RG": {"score": 2, "note": "Detailed paragraph text..."}, '
-                '"RT": {"score": 0, "note": "Detailed paragraph text..."}}. '
+                "their mechanics. Be hyper-specific to what happens on this particular run or pass play. "
+                "Provide your response STRICTLY in this JSON format, with no markdown tags, backticks, or wrap loops: "
+                '{"LT": {"score": 3, "note": "Detailed text..."}, "LG": {"score": 2, "note": "Detailed text..."}, '
+                '"C": {"score": 1, "note": "Detailed text..."}, "RG": {"score": 2, "note": "Detailed text..."}, '
+                '"RT": {"score": 0, "note": "Detailed text..."}}. '
             )
 
             content_list = [{"type": "text", "text": coaching_prompt}]
@@ -171,8 +169,11 @@ def render_film_room():
         if uploaded_file:
             st.success("Film loaded successfully!")
             
-            if st.session_state.get("current_file_name") != uploaded_file.name:
-                st.session_state["current_file_name"] = uploaded_file.name
+            # Generate a truly unique signature matching name and file size
+            file_signature = f"{uploaded_file.name}_{uploaded_file.size}"
+            
+            if st.session_state.get("last_file_signature") != file_signature:
+                st.session_state["last_file_signature"] = file_signature
                 st.session_state["analysis_run"] = False
                 if "active_grades" in st.session_state:
                     del st.session_state["active_grades"]
@@ -210,7 +211,7 @@ def render_film_room():
                 
     with col2:
         st.markdown("### Front-Five Film Grade Sheet")
-        if not uploaded_file or not st.session_state.get("analysis_run", False):
+        if not uploaded_file or not st.session_state.get("analysis_run", False) or "active_grades" not in st.session_state:
             st.write("Upload a video and click 'Run AI Film Grader' to process scores.")
         else:
             current_grades = st.session_state["active_grades"]
@@ -236,7 +237,7 @@ def render_film_room():
                 
                 if st.form_submit_button("Save & Finalize Grades", use_container_width=True, type="primary"):
                     st.session_state["past_films"].append({
-                        "filename": st.session_state.get("current_file_name", "Evaluated Clip"),
+                        "filename": uploaded_file.name,
                         "video_bytes": uploaded_file.getvalue(),
                         "grades": form_data,
                         "total_score": total_points,
@@ -356,5 +357,5 @@ def show_dashboard():
 # --- MAIN ROUTING ENGINE ---
 if "user" in st.session_state:
     show_dashboard()
-if "user" not in st.session_state:
+else:
     show_auth_page()
