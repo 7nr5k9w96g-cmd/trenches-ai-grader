@@ -3,15 +3,26 @@ from dotenv import load_dotenv
 import os
 import tempfile
 import json
+import time
 import base64
 import requests
 from datetime import datetime
+from google import genai
+from google.genai import types
 
-# Safely import openCV for visual frame extraction
 try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    from vision_pipeline import (
+        run_vision_pipeline, TECHNIQUE_LABELS, save_training_label,
+        train_classifier, get_training_stats, predict_technique
+    )
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -25,29 +36,31 @@ if "past_films" not in st.session_state:
 if "app_mode" not in st.session_state:
     st.session_state["app_mode"] = "Film Room & Grading"
 
-# --- VIDEO HELPER: SAMPLE FRAMES FOR GPT-4o ---
-def extract_video_frames(video_path, max_frames=12):
+def extract_video_frames(video_path, fps_target=6, max_frames=60):
     if cv2 is None:
         return None
-    base64_frames = []
+    frames = []
     video = cv2.VideoCapture(video_path)
-    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
+    total = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    native_fps = video.get(cv2.CAP_PROP_FPS) or 30
+    if total <= 0:
         video.release()
         return None
-    
-    step = max(1, total_frames // max_frames)
-    for i in range(0, total_frames, step):
+    # Scale frame count with duration: fps_target frames per second, capped at max_frames
+    duration_secs = total / native_fps
+    target = min(max(int(duration_secs * fps_target), 10), max_frames)
+    step = max(1, total // target)
+    indices = list(range(0, total, step))[:target]
+    for i in indices:
         video.set(cv2.CAP_PROP_POS_FRAMES, i)
-        success, frame = video.read()
-        if not success:
-            break
-        _, buffer = cv2.imencode(".jpg", frame)
-        base64_frames.append(base64.b64encode(buffer).decode("utf-8"))
-        if len(base64_frames) >= max_frames:
-            break
+        ok, frame = video.read()
+        if not ok:
+            continue
+        frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        frames.append(base64.b64encode(buf).decode("utf-8"))
     video.release()
-    return base64_frames
+    return frames if frames else None
 
 # --- SECURE FIREBASE AUTHENTICATION ENGINE ---
 def firebase_auth_request(endpoint, email, password):
@@ -88,199 +101,267 @@ def firebase_auth_request(endpoint, email, password):
     except Exception as e:
         return None, f"Network timeout or server configuration mismatch: {str(e)}"
 
-# --- AI MULTIMODAL FILM ENGINE ---
-def analyze_football_film_with_openai(video_path):
-    api_key = os.getenv("OPENAI_API_KEY")
+# --- AI MULTIMODAL FILM ENGINE (Gemini) ---
+# play_type: "Auto-Detect", "Run Play", or "Pass Play"
+RUN_PLAY_TYPES = [
+    "General Run Play",
+    "Power / Power-O",
+    "Counter",
+    "Iso / Lead",
+    "Inside Zone (IZ)",
+    "Outside Zone (OZ)",
+    "Draw",
+    "Trap",
+]
+
+def analyze_football_film_with_gemini(video_path, play_type="Auto-Detect", run_type=None, player_ids=None):
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        st.error("Missing OPENAI_API_KEY in your env configuration.")
-        return None
-        
-    if cv2 is None:
-        st.error("Missing dependencies: 'opencv-python-headless' must be installed on your backend machine.")
+        st.error("Missing GEMINI_API_KEY in your env configuration.")
         return None
 
     try:
-        with st.spinner("Analyzing film timeline using professional O-Line grading standards..."):
-            base64_frames = extract_video_frames(video_path, max_frames=12)
-            if not base64_frames:
-                st.error("Could not parse or decode frames from this video file.")
+        client = genai.Client(api_key=api_key)
+
+        with st.spinner("Extracting frames from film..."):
+            if cv2 is None:
+                st.error("opencv-python-headless is not installed.")
                 return None
+            frames = extract_video_frames(video_path)
+            if not frames:
+                st.error("Could not extract frames from this video file.")
+                return None
+            st.caption(f"Extracted {len(frames)} frames for analysis.")
 
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
-            }
-            
+        cv_data = None
+        if VISION_AVAILABLE:
+            with st.spinner("Running player detection and pose estimation..."):
+                cv_text, cv_err, cv_features = run_vision_pipeline(video_path)
+                if cv_text:
+                    # Run classifier predictions if model exists
+                    predictions = {}
+                    for pos, feats in cv_features.items():
+                        pred = predict_technique(feats)
+                        if pred:
+                            predictions[pos] = pred
+                    if predictions:
+                        pred_lines = "\n".join(f"  {pos}: {tech}" for pos, tech in predictions.items())
+                        cv_text += f"\n\nCLASSIFIER PREDICTIONS (trained on coach-labeled film):\n{pred_lines}\nUse these as a strong prior — override only if the frames clearly contradict them.\n"
+                    cv_data = cv_text
+                    st.session_state["last_cv_features"] = cv_features
+                # Non-fatal — if CV fails, Gemini still runs on frames alone
+
+        with st.spinner("Analyzing film using professional O-Line grading standards..."):
+            # Play type override injected at the very top of the prompt
+            if play_type == "Run Play":
+                if run_type and run_type != "General Run Play":
+                    play_type_override = (
+                        f"PLAY TYPE: The coach has confirmed this is a RUN PLAY — the scheme is {run_type}. "
+                        f"Use ONLY the run blocking grading criteria. Do NOT apply pass protection grading. "
+                        f"IMPORTANT: Do not assume what any individual lineman is doing based on the scheme name. "
+                        f"Observe what each player actually does in the frames, then evaluate those observed actions "
+                        f"against the {run_type} technique standards. A lineman may be pulling, driving, zoning, or doing something else entirely — "
+                        f"grade what you see, not what you expect from the scheme label.\n\n"
+                    )
+                else:
+                    play_type_override = (
+                        "PLAY TYPE: The coach has confirmed this is a RUN PLAY. "
+                        "Use ONLY the run blocking grading criteria. Do NOT apply pass protection grading. "
+                        "Observe what each lineman actually does in the frames and grade those observed actions.\n\n"
+                    )
+            elif play_type == "Pass Play":
+                play_type_override = (
+                    "CRITICAL OVERRIDE: The coach has confirmed this is a PASS PLAY. "
+                    "You MUST evaluate this as a pass play using ONLY the pass protection criteria. "
+                    "Do NOT classify it as a run play. Do NOT apply run blocking grading. "
+                    "Skip Step 3 classification and proceed directly to pass play grading.\n\n"
+                )
+            else:
+                play_type_override = ""
+
+            ids = player_ids or {}
+            pos_desc = ["far left of the line", "second from left", "middle (snaps ball)", "second from right", "far right of the line"]
+            if any(v.strip() for v in ids.values()):
+                id_lines = []
+                for i, pos in enumerate(["LT", "LG", "C", "RG", "RT"]):
+                    pid = ids.get(pos, "").strip()
+                    id_lines.append(f"- {pos}: jersey #{pid}" if pid else f"- {pos}: not tagged — use spatial position ({pos_desc[i]})")
+                player_id_section = (
+                    "STEP 1 - PLAYER IDENTIFICATION (provided by coach):\n"
+                    + "\n".join(id_lines)
+                    + "\n\nDo NOT attempt to re-identify players yourself. Trust the coach's tags. "
+                    "Watch what each tagged player does in the frames and grade their technique.\n\n"
+                )
+            else:
+                player_id_section = (
+                    "STEP 1 - IDENTIFY EACH LINEMAN BY POSITION (no tags provided):\n"
+                    "A. Find the row of 5 players at the line of scrimmage.\n"
+                    "B. CENTER is the middle player of that row — #3 of 5 from either end. He snaps the ball.\n"
+                    "C. QB is directly behind the center. Use him to confirm.\n"
+                    "D. One left of center = LG, one right = RG, far left = LT, far right = RT.\n"
+                    "E. Lock these in and do not change them mid-play.\n\n"
+                )
+
+            cv_section = (cv_data + "\n\n") if cv_data else ""
+
             coaching_prompt = (
-                You are an elite, multi-level offensive line coach and film coordinator with deep expertise across NFL, college, and high school systems. Analyze these chronological video frames of a football play.
-
-STEP 1 — PRE-SNAP READ:
-Before grading, identify and note:
-- Defensive front structure (4-3, 3-4, 4-2-5 nickel, bear, eagle, odd/even front)
-- DL shade alignments (0-tech, 1-tech, 2i, 3-tech, 4i, 5-tech, 6/7-tech, 9-tech)
-- Any pre-snap movement, blitz indicators, or late defensive rotation
-- Protection scheme likely called based on alignment
-
-STEP 2 — PLAY TYPE IDENTIFICATION:
-Analyze alignment, initial movement vectors, and block tracks to definitively classify as RUN PLAY or PASS PLAY.
-
-STEP 3 — GRADING:
-Evaluate all 5 positions (LT, LG, C, RG, RT) using the appropriate technique library below.
-
-═══ IF RUN PLAY — evaluate each lineman against these criteria as applicable ═══
-
-GET-OFF & INITIAL STEP:
-- Explosive first-step quickness off the snap (no false step, simultaneous foot-hand fire)
-- Proper directional first step for block type (power step, angle step, bucket step, zone step, pull drop step)
-- Pad level at snap and maintained throughout block — lower pad wins leverage
-
-DRIVE BLOCK: 6-inch power step directly at defender, hat on near number, hands fire at foot contact (never early/late), roll hips through, chase defender's heels, sustain to whistle
-
-DOWN BLOCK: Flat angle step toward inside gap, flat back posture, seal inside shoulder to create a wall, prevent penetration into adjacent gap
-
-REACH / HOOK BLOCK: Bucket step (outside foot first), beat defender's outside shoulder, stretch across face, lock out to hook inside, cut off pursuit
-
-SCOOP BLOCK: Inside lineman takes angle step to start combo, outside lineman gains ground, both converge on defender's inside hip, hand-off timing is critical
-
-COMBO / DOUBLE-TEAM: Hip-to-hip alignment at point of attack, same-side inside feet step together simultaneously, drive low and wide (not high), communicate LB call and execute climb break at correct moment — both linemen stay engaged until climb trigger
-
-ZONE BLOCKING (IZ/OZ): Lateral zone step in play direction, track inside hip pocket of assigned defender, cut-off angle achieved, stay square, feel combo responsibilities, reach the edge on outside zone without overrunning
-
-PULLING — KICK-OUT: Drop jab step gaining depth, flat pull path behind LOS, square up at kick-out point, log the EMOL or kick him outside to create a lane, never overrun the block
-
-PULLING — WRAP / LEAD: Tight flat pull behind center, turn upfield cleanly through hole, find and square up on linebacker in alley, deliver physical blow, drive through
-
-TRAP BLOCK: Quick drive step in correct direction, stay low and on a flat path, use surprise angle on trapped DT, drive through near number aggressively
-
-CROSS BLOCK / COUNTER SCHEME: Linemen exchange gap assignments — first man executes down block, second man pulls through. Timing of cross is critical; evaluate both players on timing, path, and finish
-
-CLIMBING TO SECOND LEVEL: Decisive break from combo at correct moment (not too early, not too late), flat path to linebacker, mirror LB drop or scrape, engage on the move with square pad level, don't overpursue or miss angle
-
-BACKSIDE CUTOFF: Angle back to prevent defender pursuit, maintain leverage even when releasing to next level, string out the play
-
-PHYSICALITY STANDARD FOR RUN: Lineman must be aggressive, low, and move the defender. Winning leverage and controlling the block counts more than just being in position.
-
-═══ IF PASS PLAY — evaluate each lineman against these criteria as applicable ═══
-
-SET TYPE:
-- VERTICAL SET: Quick kick-step back and out, set depth 3–4 yards for standard drops, maintain inside leverage throughout, mirror rusher's alignment, never get too deep too fast
-- 45-DEGREE SET: Angled kick to force rusher wide and upfield, used against speed-to-power rushers, protects against inside counter moves
-- JUMP / AGGRESSIVE SET: Short flat kick — attack rusher at or near LOS for quick game, RPOs, max protect concepts
-- Evaluate whether the SET TYPE chosen was correct for this defensive look
-
-FOOTWORK & POSITIONING:
-- Patient feet — never lunge or over-extend, stay connected to rusher's inside shoulder
-- Proper heel-to-toe depth in kick-slide, never flat-footed
-- Stay square — hips not turned, chest facing defender
-- Maintain leverage and never allow rusher to gain inside position
-
-HAND TECHNIQUE:
-- Independent hand strike (punch) to inside chest plate with thumbs up, elbows in
-- Fire hands at moment of contact — not early (wasted punch), not late (absorbed)
-- Active hand replacement after swipe, rip, or club — second punch critical, never remain dead-handed
-- Re-grip and reset grip throughout the rep
-
-ANCHORING AGAINST BULL RUSH:
-- Sink hips and widen base AT contact point
-- Absorb force into ground — movement should be zero or absorbed upward, not driven backward
-- Drive feet on contact, counter with push-pull technique
-- Keep weight forward, not on heels
-
-COUNTER MOVES — SPEED RUSH:
-- Flatten redirect: shorten kick-step, redirect path to flatten rusher upfield
-- Never over-kick and open the hip to inside move
-- Secondary quick-set after rusher commits outside
-- Stay square on redirect
-
-COUNTER MOVES — INSIDE COUNTER (swim/spin/inside chop):
-- Anticipate inside move after initial outside set
-- Quick lateral step back inside, regain chest position
-- Re-punch to regain inside leverage
-
-STUNTS & TWISTS (T/E, E/T, loops, dogs):
-- Stay on first rusher until second man clearly shows in gap
-- Communicate "passing off" with adjacent lineman verbally and physically
-- Don't abandon first rusher too early (creates double-gap problem)
-- Don't chase a looping rusher off assignment
-
-PICKING UP BLITZERS:
-- Inside-out protection priority
-- Clean hand-off from lineman to lineman on inside stunts
-- Call out late blitz to alert protection
-
-SUSTAINED TECHNIQUE:
-- Knee bend and pad level must be maintained throughout the rep — evaluate at snap, mid-rep, and at top of the pocket
-- Balance and body control after failed counter or stunt — does he recover or fall off?
-
-═══ POSITION-SPECIFIC EVALUATION STANDARDS ═══
-
-LT — Primary focus: edge pass protection against speed rushers, vertical set depth, ability to handle bull/spin/speed-to-power combinations, edge containment on run, anchor on twists/stunts directed at his side.
-
-LG — Primary focus: power at point of attack on inside run blocks, combo work with C and LT, pull assignments on power/counter/trap, handling inside stunts and A/B gap blitzes.
-
-C — Primary focus: pre-snap identification of Mike LB and protection call, snap-to-footwork coordination (no false step post-snap), reach blocks on shaded DTs, combo initiation, picking up A-gap blitzes and zero-tech rushers.
-
-RG — Primary focus: double-team at POA with RT or C, down block angle efficiency, pull assignments on trap/counter, handling 3-tech pass rush, managing B-gap on pass protection.
-
-RT — Primary focus: drive block on 5-tech defenders, reach block on wide 5/9 on outside zone, pass set depth for bootleg/sprint-out timing, handling edge stunts to the right side.
-
-═══ GRADING SCALE — STRICTLY ENFORCE ═══
-
-Score 0 — ASSIGNMENT FAILURE: Lineman did not do their job and was not physical. Examples: allows free rusher/defender, completely missed assignment, wrong block path, zero physicality on contact.
-
-Score 1 — PARTIAL EXECUTION: Correct assignment identified but a major technique flaw significantly limited effectiveness. Examples: lunged and lost leverage, late hand fire, wrong footwork for block type, lost combo too early.
-
-Score 2 — SOLID EXECUTION: Assignment completed, adequate technique, physical on contact, but a minor correctable flaw is present. Examples: slightly high pad level on finish, hand reset needed mid-rep, minor foot placement issue that didn't cost the block.
-
-Score 3 — DOMINANT EXECUTION: Perfect assignment + elite technique + high physicality + full control of defender throughout the play. All three pillars must be present. A 3 is reserved for plays where the lineman totally dominated his assignment.
-
-═══ COACHING NOTE REQUIREMENTS ═══
-For each position, write a highly detailed, comprehensive coaching breakdown (3-5 sentences) that:
-- Names the specific block type or protection set used
-- Calls out specific technique elements by name (e.g., "failed to drive the inside hip on the combo," "hand replacement after the rip was too slow")
-- References the defensive alignment or move that challenged the lineman
-- Is hyper-specific to exactly what happened on this particular play
-- Uses proper coaching terminology consistent with NFL, college, and high school coaching standards
-
-═══ OUTPUT FORMAT ═══
-Respond STRICTLY in this JSON format with no markdown, no backticks, no wrapper text:
-{"LT": {"score": 3, "note": "Detailed coaching text..."}, "LG": {"score": 2, "note": "Detailed coaching text..."}, "C": {"score": 1, "note": "Detailed coaching text..."}, "RG": {"score": 2, "note": "Detailed coaching text..."}, "RT": {"score": 0, "note": "Detailed coaching text..."}}
+                cv_section +
+                play_type_override +
+                "You are an elite, multi-level offensive line coach and film coordinator with deep expertise across NFL, college, and high school systems. Analyze these chronological video frames of a football play.\n\n"
+                + player_id_section
+                + "STEP 2 - PRE-SNAP READ:\n"
+                "- Defensive front structure (4-3, 3-4, 4-2-5 nickel, bear, eagle, odd/even front)\n"
+                "- DL shade alignments (0-tech, 1-tech, 2i, 3-tech, 4i, 5-tech, 6/7-tech, 9-tech)\n"
+                "- Any pre-snap movement, blitz indicators, or late defensive rotation\n\n"
+                "STEP 3 - PLAY TYPE IDENTIFICATION:\n"
+                "Analyze alignment, initial movement vectors, and block tracks to definitively classify as RUN PLAY or PASS PLAY.\n\n"
+                "STEP 4 - INDIVIDUAL LINEMAN TRACKING (REQUIRED BEFORE GRADING):\n"
+                "CRITICAL RULE: Grade what you SEE, not what you expect. The play type label tells you which rubric to score against — "
+                "it does NOT tell you what each lineman is doing. Do not assume a lineman is pulling, zoning, or driving just because the play type implies it. "
+                "Watch what each player actually does in the frames and grade that action.\n\n"
+                "For each of the 5 linemen — LT, LG, C, RG, RT — trace what you actually observe across the frames:\n"
+                "1. Starting stance and alignment vs the defender in front of them\n"
+                "2. First step: the exact direction and type of step you see them take (lateral, forward, angle drop, kick slide, etc.)\n"
+                "3. Who or what they actually move toward and engage\n"
+                "4. What happens at contact: hand placement, pad level, leverage won or lost — based on what the frames show\n"
+                "5. How the block finishes: sustained, broke down, drove, released early — what you can see\n"
+                "If you cannot clearly see a lineman's actions due to camera angle or occlusion, say so explicitly. Do not fabricate.\n\n"
+                "STEP 5 - GRADING:\n"
+                "Grade each position based solely on what you observed in Step 4. Apply the rubric for this play type.\n\n"
+                "=== IF RUN PLAY - evaluate against these criteria ===\n\n"
+                "GET-OFF & INITIAL STEP:\n"
+                "- Explosive first-step quickness off snap - no false step, simultaneous foot-hand fire\n"
+                "- Correct directional first step for the block type (power step, angle step, bucket step, zone step, pull drop step)\n"
+                "- Pad level at snap and maintained throughout - lower pad wins leverage\n\n"
+                "DRIVE BLOCK: 6-inch power step at defender, hat on near number, hands fire at foot contact, roll hips through, chase defender's heels, sustain to whistle\n\n"
+                "DOWN BLOCK: Flat angle step to inside gap, flat back, seal inside shoulder to create a wall, prevent penetration\n\n"
+                "REACH / HOOK BLOCK: Bucket step (outside foot first), beat defender's outside shoulder, stretch across face, lock out to hook\n\n"
+                "SCOOP BLOCK: Inside lineman angle step, outside lineman gains ground, both converge on defender's inside hip, hand-off timing critical\n\n"
+                "COMBO / DOUBLE-TEAM (ACE/DEUCE/TREY): Hip-to-hip at POA, same-side inside feet step simultaneously, drive low and wide, communicate and execute climb break at correct moment - both stay engaged until climb trigger\n\n"
+                "DUO BLOCK: Pure double-team power with no climb intent - both linemen drive defender off the LOS, evaluate sustained joint push and pad level\n\n"
+                "ZONE BLOCKING (IZ/OZ): Lateral zone step in play direction, track inside hip pocket of assigned defender, achieve cut-off angle, stay square, feel combo responsibilities, reach edge on OZ without overrunning\n\n"
+                "PULLING - KICK-OUT: Drop jab step gaining depth, flat pull path, square up at kick-out point, log or kick the EMOL, never overrun\n\n"
+                "PULLING - WRAP / LEAD: Tight flat pull, turn upfield cleanly through hole, square up on linebacker in alley, deliver physical blow\n\n"
+                "TRAP BLOCK: Quick drive step on flat path, stay low, surprise angle on trapped DT, drive through near number\n\n"
+                "CROSS BLOCK / G-T COUNTER / COUNTER TREY: Evaluate both the down-blocking lineman AND the pulling lineman separately - down blocker path and seal, puller's depth, flat pull path, kick-out vs wrap assignment, and finish\n\n"
+                "PIN & PULL (perimeter): Inside lineman pins - evaluate seal angle and width; outside puller - evaluate pull path, turn upfield, and block in space at second level\n\n"
+                "WHAM BLOCK SCHEME: When FB/TE executes wham kick-out, evaluate the releasing lineman's path - correct release angle, timing away from the wham blocker, and arrival at second-level assignment\n\n"
+                "SPLIT ZONE: Line zones one direction - evaluate each lineman's zone path; backside lineman's cutoff angle when H-back kicks EMOL is critical - evaluate his release timing and cutoff block\n\n"
+                "HINGE / TURNBACK BLOCK (bootleg/naked): Backside lineman stays between rusher and QB path, gives ground under control, does not chase - evaluate body position and containment\n\n"
+                "BACKSIDE CUTOFF: Angle back to prevent pursuit, maintain leverage, string out the play\n\n"
+                "PHYSICALITY STANDARD FOR RUN: Must be aggressive, low, and moving the defender. Winning leverage matters more than just being in position.\n\n"
+                "=== IF PASS PLAY - evaluate against these criteria ===\n\n"
+                "PROTECTION SCHEME IDENTIFICATION (visual read only):\n"
+                "- BOB (Big on Big / man): covered linemen block their man, uncovered work inside-out to first threat\n"
+                "- FULL SLIDE: entire line zones one direction - evaluate each lineman's gap discipline and correct zone-side assignment\n"
+                "- HALF SLIDE / 4-MAN SLIDE: one side zones, backside tackle mans up on edge - evaluate correct role identification and execution for each lineman\n"
+                "- COMBINATION PROTECTION: zone blocking on one side of the center, man blocking on the other - this is the most critical to grade correctly. Evaluate whether each lineman correctly identified his scheme side. On the zone side: gap discipline, no chasing, correct area coverage. On the man side: proper tracking of assigned rusher, no abandoning man for a ghost. A lineman executing man technique on a zone side (or vice versa) is a technique error regardless of outcome.\n\n"
+                "SET TYPE:\n"
+                "- VERTICAL SET: Quick kick-step back and out, set depth 3-4 yards, maintain inside leverage, mirror rusher's alignment\n"
+                "- 45-DEGREE SET: Angled kick to force rusher wide, used against speed-to-power rushers, protects inside counter\n"
+                "- JUMP / AGGRESSIVE SET: Short flat kick, attack rusher at or near LOS for quick game/RPO/max protect\n"
+                "- Evaluate whether set type chosen was correct for the defensive look\n\n"
+                "FOOTWORK & POSITIONING: Patient feet, stay connected to rusher's inside shoulder, heel-to-toe depth in kick-slide, stay square, never allow rusher inside position\n\n"
+                "HAND TECHNIQUE: Independent punch to inside chest plate (thumbs up, elbows in), hands fire at contact, active hand replacement after swipe/rip/club, re-grip and reset throughout rep\n\n"
+                "ANCHORING VS BULL RUSH: Sink hips and widen base at contact, absorb into ground, drive feet, counter with push-pull, weight forward not on heels\n\n"
+                "COUNTER MOVES - SPEED RUSH: Flatten redirect, shorten kick, redirect path to flatten rusher upfield, never over-kick and open hip\n\n"
+                "COUNTER MOVES - INSIDE COUNTER (swim/spin/chop): Quick lateral step back inside, regain chest position, re-punch for inside leverage\n\n"
+                "STUNTS & TWISTS (T/E, E/T, fire stunts, loops): Stay on first rusher until second man clearly shows, pass off cleanly, never abandon first rusher too early\n\n"
+                "SCREEN BLOCKING: Correct chip-and-release timing - deliver a controlled chip on the pass rusher, then release cleanly to second level; evaluate arrival angle and block in space on screen target defender\n\n"
+                "SUSTAINED TECHNIQUE: Knee bend and pad level evaluated at snap, mid-rep, and top of pocket - must be maintained throughout\n\n"
+                "=== PENALTY AWARENESS - apply to ALL plays ===\n\n"
+                "Actively flag any of the following if visible in the frames:\n"
+                "- HOLDING: hands outside the frame, jersey pull, arm-bar wrap around defender\n"
+                "- HANDS TO THE FACE: palm or forearm contacting defender's helmet or facemask\n"
+                "- FALSE START: any pre-snap flinch or movement before the ball\n"
+                "- ILLEGAL BLOCK IN THE BACK: contact on the back of a defender away from the ball (perimeter runs, screens)\n"
+                "- CHOP BLOCK RISK: any high/low combination where one blocker goes low while another is already engaged high on the same defender\n\n"
+                "PENALTY GRADING RULE: If a penalty is identified, note it explicitly in the coaching note. A technically sound block that draws or risks a flag CANNOT score a 3. A block that both wins AND avoids penalties is a prerequisite for elite grades.\n\n"
+                "=== EFFORT & FINISH - apply to ALL plays ===\n\n"
+                "Evaluate the following on every lineman:\n"
+                "- Did he sustain his block through the whistle, or did he let up early?\n"
+                "- RUN: Did he drive his feet and finish, or make contact and stall?\n"
+                "- PASS: Did he maintain his set for the full rep, or relax before the throw?\n"
+                "- Did he pursue a second-level block or deliver a chip after his initial assignment was sealed?\n"
+                "- HIGH MOTOR PLAYS: pancake attempts, staying attached on long developing runs, sprinting downfield to finish - these push a borderline 2 to a 3\n"
+                "- EFFORT DEDUCTION RULE: A technically correct block that quit early or showed no motor CANNOT score a 3. Early release on a play requiring a finish is an automatic deduction.\n\n"
+                "=== POSITION-SPECIFIC EVALUATION STANDARDS ===\n\n"
+                "LT - Primary: edge pass protection vs speed rushers, vertical set depth, handle bull/spin/speed-to-power combos, edge containment on run, stunt/twist anchoring on his side\n\n"
+                "LG - Primary: power at POA on inside run, combo work with C and LT, pull assignments on power/counter/trap, handle inside stunts and A/B gap blitzes\n\n"
+                "C - Primary: snap-to-footwork coordination (no false step post-snap), reach blocks on shaded DTs, combo initiation, picking up A-gap blitzes and zero-tech rushers\n\n"
+                "RG - Primary: double-team at POA with RT or C, down block angle, pull on trap/counter, handle 3-tech pass rush, B-gap management\n\n"
+                "RT - Primary: drive block on 5-tech, reach block on wide 5/9 on OZ, pass set depth for bootleg/sprint-out, handle edge stunts to right side\n\n"
+                "=== GRADING SCALE - STRICTLY ENFORCE ===\n\n"
+                "Score 0 - ASSIGNMENT FAILURE: Did not do their job, was not physical. Allows free rusher, missed assignment, wrong path, zero effort.\n\n"
+                "Score 1 - PARTIAL EXECUTION: Correct assignment but a major technique flaw significantly limited effectiveness (lunged, late hands, wrong footwork, lost combo too early).\n\n"
+                "Score 2 - SOLID EXECUTION: Assignment completed, physical on contact, but a minor correctable flaw present (slightly high pad level on finish, hand reset needed, minor foot placement issue).\n\n"
+                "Score 3 - DOMINANT EXECUTION: Perfect assignment + elite technique + high physicality + full finish through the whistle + zero penalty risk. ALL four pillars required. A 3 is reserved for total domination of the assignment.\n\n"
+                "=== COACHING NOTE REQUIREMENTS ===\n\n"
+                "For each position write a thorough coaching note structured as follows. Take as many sentences as needed — do not cut yourself short:\n\n"
+                "SENTENCE 1 — WHAT YOU SAW (observation only, no evaluation yet): Describe the specific physical actions this lineman took. "
+                "Name their first step direction, who or what they moved toward, whether they made contact, what their body position looked like. "
+                "Example: 'The LT took a short lateral zone step left, climbed to the second level, and arrived at the linebacker as the ball carrier cut back.' "
+                "Do NOT evaluate yet — just describe what the frames show.\n\n"
+                "SENTENCES 2-3 — TECHNIQUE EVALUATION: Now evaluate those observed actions against the criteria for this block type. "
+                "Name specific technique flaws or wins by their coaching term. Reference the defensive look that challenged him. "
+                "Example: 'His bucket step was correct for the reach assignment against the 5-tech, but his hands were outside the frame on initial contact, preventing a clean lock-out.'\n\n"
+                "SENTENCE 4 — EFFORT AND FINISH: Did he sustain through the whistle? Did he drive feet after contact or go passive? Note any motor plays or early releases.\n\n"
+                "SENTENCE 5 (if applicable) — PENALTY RISK or VISIBILITY NOTE: Flag any penalty risk, OR if the camera angle limited visibility of this lineman, state that honestly. "
+                "Do not guess or fabricate observations for linemen you could not clearly see.\n\n"
+                "=== OUTPUT FORMAT ===\n\n"
+                "Respond STRICTLY in this JSON format with no markdown, no backticks, no wrapper text:\n"
+                "{\"LT\": {\"score\": 3, \"note\": \"Detailed coaching text...\"}, \"LG\": {\"score\": 2, \"note\": \"Detailed coaching text...\"}, "
+                "\"C\": {\"score\": 1, \"note\": \"Detailed coaching text...\"}, \"RG\": {\"score\": 2, \"note\": \"Detailed coaching text...\"}, "
+                "\"RT\": {\"score\": 0, \"note\": \"Detailed coaching text...\"}}"
             )
 
-            content_list = [{"type": "text", "text": coaching_prompt}]
-            for frame in base64_frames:
-                content_list.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{frame}"}
-                })
+            contents = [types.Part(text=coaching_prompt)]
+            for frame_b64 in frames:
+                contents.append(types.Part(
+                    inline_data=types.Blob(
+                        mime_type="image/jpeg",
+                        data=base64.b64decode(frame_b64)
+                    )
+                ))
 
-            payload = {
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": content_list}],
-                "response_format": {"type": "json_object"}
-            }
-
-            response = requests.post(url, headers=headers, json=payload, timeout=90)
-            if response.status_code == 200:
-                result_json = response.json()
-                text_response = result_json["choices"][0]["message"]["content"]
-                return json.loads(text_response)
-            
-            st.error(f"OpenAI API Error ({response.status_code}): {response.text}")
-            return None
+            last_error = None
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            max_output_tokens=8192,
+                            thinking_config=types.ThinkingConfig(
+                                thinking_budget=24576
+                            )
+                        )
+                    )
+                    return json.loads(response.text)
+                except Exception as e:
+                    last_error = e
+                    if attempt < 2:
+                        wait = 10 * (attempt + 1)
+                        st.caption(f"Gemini busy — retrying in {wait}s (attempt {attempt + 2}/3)...")
+                        time.sleep(wait)
+            raise last_error
     except Exception as e:
-        st.error(f"Request failed: {e}")
+        st.error(f"Gemini analysis failed: {str(e)}")
         return None
 
 # --- UI COMPONENTS ---
 def render_film_room():
     st.title("The Film Room")
     st.caption("Upload game or practice clips to run AI technique analysis.")
+    st.info(
+        "**Disclaimer:** AI analysis may not always be accurate. If you see a wrong grade or misidentified technique, "
+        "correct it using the dropdowns after grading — every correction you make trains the system to grade better over time."
+    )
     col1, col2 = st.columns([6, 6])
     
     with col1:
-        st.markdown("### Step 1: Upload Clip")
+        st.markdown("### Step 1: Upload Film Clip")
         uploaded_file = st.file_uploader("Choose a football film clip...", type=["mp4", "mov", "avi"])
         
         if uploaded_file:
@@ -294,29 +375,81 @@ def render_film_room():
                 st.session_state["analysis_run"] = False
                 if "active_grades" in st.session_state:
                     del st.session_state["active_grades"]
+                for pos in ["LT", "LG", "C", "RG", "RT"]:
+                    st.session_state.pop(f"pid_{pos}", None)
 
             st.video(uploaded_file)
             has_run = st.session_state.get("analysis_run", False)
-            
+
             if not has_run:
+                st.markdown("### Step 2: Tag Your Players")
+                st.caption("Pause the video at the snap and enter each player's jersey number. This removes all identification guesswork from the AI — it will only grade what it sees each tagged player doing.")
+                pid_cols = st.columns(5)
+                player_ids = {}
+                for i, pos in enumerate(["LT", "LG", "C", "RG", "RT"]):
+                    with pid_cols[i]:
+                        player_ids[pos] = st.text_input(
+                            pos, placeholder="#__",
+                            key=f"pid_{pos}",
+                            help=f"Jersey number of the {pos}"
+                        )
+                any_tagged = any(v.strip() for v in player_ids.values())
+                if any_tagged:
+                    st.success("Players tagged — AI will use your identifications instead of guessing.")
+                else:
+                    st.caption("Optional but strongly recommended. Leave blank to let the AI attempt spatial identification.")
+
+                st.markdown("### Step 3: Select Play Type")
+                play_type = st.selectbox(
+                    "Tell the AI what type of play this is:",
+                    options=["Auto-Detect", "Run Play", "Pass Play"],
+                    index=0,
+                    help=(
+                        "Auto-Detect: AI reads the frames and decides. "
+                        "Run Play / Pass Play: Locks the AI to the correct criteria - "
+                        "use this when you know the play type to prevent misclassification."
+                    ),
+                    key="play_type_select"
+                )
+
+                run_type = None
+                if play_type == "Auto-Detect":
+                    st.caption("AI will attempt to classify run vs pass from the frames. For best accuracy, select the play type manually.")
+                elif play_type == "Run Play":
+                    run_type = st.selectbox(
+                        "Select the run scheme:",
+                        options=RUN_PLAY_TYPES,
+                        index=0,
+                        help="Telling the AI the exact run scheme locks its grading to the correct footwork paths, assignment rules, and technique standards for that play.",
+                        key="run_type_select"
+                    )
+                    if run_type == "General Run Play":
+                        st.caption("Locked to run blocking criteria. Select a specific scheme above for more precise grading.")
+                    else:
+                        st.caption(f"Locked to {run_type} grading criteria — AI will evaluate each lineman against the exact assignment and technique requirements for this scheme.")
+                else:
+                    st.caption("Locked to pass protection criteria: set type, hand technique, anchor, stunts, and all pass pro techniques.")
+
+                st.markdown("### Step 4: Run Analysis")
                 if st.button("Run AI Film Grader", type="primary", use_container_width=True):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+                    file_ext = os.path.splitext(uploaded_file.name)[1].lower() or ".mp4"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tfile:
                         tfile.write(uploaded_file.getvalue())
                         temp_filename = tfile.name
-                    
-                    ai_response = analyze_football_film_with_openai(temp_filename)
+
+                    ai_response = analyze_football_film_with_gemini(temp_filename, play_type=play_type, run_type=run_type, player_ids=player_ids)
                     os.unlink(temp_filename)
-                    
+
                     if ai_response:
                         st.session_state["active_grades"] = ai_response
                         st.session_state["analysis_run"] = True
+                        st.rerun()
                     else:
-                        st.error("AI grading failed. Check OpenAI platform billing or API key usage.")
-                    st.rerun()
+                        st.error("AI grading failed — see the error above for details. Check your GEMINI_API_KEY or try again.")
                     
             if has_run:
                 st.markdown("---")
-                st.markdown("### ⏱️ Film Timeline Breakdown")
+                st.markdown("### Film Timeline Breakdown")
                 st.info("**[Analysis Mode Active]** Review outputs below.")
                 if st.button("Clear / Reset Analysis", use_container_width=True):
                     st.session_state["analysis_run"] = False
@@ -343,6 +476,7 @@ def render_film_room():
             st.markdown("---")
             with st.form("grading_override_form"):
                 form_data = {}
+                technique_labels = {}
                 for pos in ["LT", "LG", "C", "RG", "RT"]:
                     st.markdown(f"**Position: {pos}**")
                     f_col1, f_col2 = st.columns([2, 5])
@@ -351,8 +485,26 @@ def render_film_room():
                     with f_col2:
                         note_val = st.text_input("Coaching Note", value=current_grades[pos]["note"], key=f"note_{pos}")
                     form_data[pos] = {"score": score_val, "note": note_val}
-                
+                    if VISION_AVAILABLE:
+                        technique_labels[pos] = st.selectbox(
+                            f"Technique ({pos}) — for classifier training",
+                            options=["— skip —"] + TECHNIQUE_LABELS,
+                            key=f"tech_{pos}"
+                        )
+
                 if st.form_submit_button("Save & Finalize Grades", use_container_width=True, type="primary"):
+                    if VISION_AVAILABLE:
+                        cv_feats = st.session_state.get("last_cv_features", {})
+                        for pos, tech in technique_labels.items():
+                            if tech and tech != "— skip —":
+                                save_training_label(
+                                    clip_name=uploaded_file.name,
+                                    position=pos,
+                                    technique=tech,
+                                    grade=form_data[pos]["score"],
+                                    notes=form_data[pos]["note"],
+                                    frame_features=cv_feats.get(pos, {})
+                                )
                     st.session_state["past_films"].append({
                         "filename": uploaded_file.name,
                         "video_bytes": uploaded_file.getvalue(),
@@ -423,6 +575,26 @@ def show_dashboard():
             key="nav_sidebar_radio", 
             on_change=on_nav_change
         )
+        if VISION_AVAILABLE:
+            st.markdown("---")
+            st.markdown("**Technique Classifier**")
+            stats = get_training_stats()
+            st.caption(f"{stats['total']} labeled clips saved")
+            if stats['total'] > 0:
+                for tech, count in sorted(stats['by_technique'].items(), key=lambda x: -x[1]):
+                    st.caption(f"  {tech}: {count}")
+            if stats['ready_to_train']:
+                if st.button("Train Model", use_container_width=True, type="primary"):
+                    with st.spinner("Training classifier..."):
+                        ok, msg = train_classifier()
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+            else:
+                needed = max(0, 20 - stats['total'])
+                st.caption(f"Label {needed} more clips to unlock training.")
+
         st.markdown("---")
         if st.button("Logout Dashboard", use_container_width=True):
             st.session_state.clear()
@@ -432,14 +604,14 @@ def show_dashboard():
         render_film_room()
         
     if app_mode == "Past Film":
-        st.title("🗂️ Historical Film Vault")
+        st.title("Historical Film Vault")
         st.caption("Review your archived clips matched alongside numerical performance metric configurations.")
         
         if not st.session_state["past_films"]:
             st.info("No clips have been archived yet. Go to 'Film Room & Grading' to run your first evaluation.")
         else:
             for idx, saved in enumerate(reversed(st.session_state["past_films"])):
-                with st.expander(f"🎬 {saved['filename']} — Graded: {saved['timestamp']}", expanded=(idx==0)):
+                with st.expander(f"{saved['filename']} -- Graded: {saved['timestamp']}", expanded=(idx==0)):
                     v_col, g_col = st.columns([7, 5])
                     with v_col:
                         st.markdown("**Film Playback Loop**")
@@ -456,15 +628,15 @@ def show_dashboard():
                             st.markdown(f"**Position {pos}:** `{info['score']} / 3` Points")
                         
     if app_mode == "Team Reports":
-        st.title("📝 Scouting Reports & Coaching Logs")
+        st.title("Scouting Reports & Coaching Logs")
         st.caption("Comprehensive textual technique breakdowns and logs itemized by compilation timestamps.")
         
         if not st.session_state["past_films"]:
             st.info("No logs have been processed yet. Finalize grades in the Film Room to generate an export block.")
         else:
             for idx, saved in enumerate(reversed(st.session_state["past_films"])):
-                st.markdown(f"### 📋 Report Log: {saved['filename']}")
-                st.caption(f"⏱️ **Graded On:** {saved['timestamp']} | 📊 **Unit Grade Score:** {saved['total_score']}/15 ({saved['efficiency']}%)")
+                st.markdown(f"### Report Log: {saved['filename']}")
+                st.caption(f"Graded On: {saved['timestamp']} | Unit Grade Score: {saved['total_score']}/15 ({saved['efficiency']}%)")
                 
                 for pos, info in saved["grades"].items():
                     st.markdown(f"**{pos} Evaluation (Grade: {info['score']}/3)**")
