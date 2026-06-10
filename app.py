@@ -468,10 +468,9 @@ def render_film_room():
             total_points = sum([int(info["score"]) for info in current_grades.values()])
             efficiency_pct = int((total_points / 15) * 100)
             
-            m1, m2, m3 = st.columns(3)
+            m1, m2 = st.columns(2)
             m1.metric(label="Unit Grade Score", value=f"{total_points} / 15")
             m2.metric(label="Play Efficiency", value=f"{efficiency_pct}%")
-            m3.metric(label="Unit Avg Get-off", value="0.22s")
             
             st.markdown("---")
             with st.form("grading_override_form"):
